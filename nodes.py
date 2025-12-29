@@ -76,7 +76,8 @@ class StringSplit:
 
 class ImageDominantColor:
     """
-    提取图片主色调，输出纯色图片和十六进制色值字符串
+    提取图片主色调，支持提取多种颜色（最多32种）
+    输出：色板图片、HEX颜色列表字符串、以及前5种颜色的独立HEX输出
     """
     
     @classmethod
@@ -84,19 +85,20 @@ class ImageDominantColor:
         return {
             "required": {
                 "image": ("IMAGE",),
+                "max_colors": ("INT", {"default": 5, "min": 1, "max": 32, "step": 1}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("image", "hex_color")
-    FUNCTION = "get_dominant_color"
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("image_palette", "hex_list", "hex_1", "hex_2", "hex_3", "hex_4", "hex_5")
+    FUNCTION = "get_dominant_colors"
     CATEGORY = "image"
 
-    def get_dominant_color(self, image):
+    def get_dominant_colors(self, image, max_colors=5):
         # image is a torch tensor: [batch, height, width, channels] (0-1 float)
         # We process the first image in the batch
         import torch
-        from PIL import Image
+        from PIL import Image, ImageDraw
         import numpy as np
 
         # Convert tensor to PIL Image (take first image of batch)
@@ -110,29 +112,63 @@ class ImageDominantColor:
         if img_small.mode != "RGB":
             img_small = img_small.convert("RGB")
             
-        # Efficiently find dominant color using quantization
-        # This forces the image to 1 color, finding the most representative one
-        result = img_small.quantize(colors=1)
-        dominant_color = result.getpalette()[:3]
+        # Efficiently find dominant colors using quantization
+        # This reduces the image to 'max_colors' colors
+        result = img_small.quantize(colors=max_colors)
         
-        # Hex string
-        hex_color = "#{:02x}{:02x}{:02x}".format(dominant_color[0], dominant_color[1], dominant_color[2])
+        # Get palette (r, g, b, r, g, b, ...)
+        palette = result.getpalette() or []
+        # Quantize might return a palette of 256 entries (768 ints), trimming to used colors
+        # We need to find which colors are actually used and sort by frequency
+        # Convert quantized image to data to count frequencies
+        color_counts = result.getcolors(maxcolors=256)
+        if color_counts:
+            # Sort by count (descending)
+            color_counts.sort(key=lambda x: x[0], reverse=True)
+            # Limit to max_colors found (in case < max_colors)
+            dominant_colors = []
+            for count, index in color_counts[:max_colors]:
+                # Extract RGB from palette
+                r = palette[index * 3]
+                g = palette[index * 3 + 1]
+                b = palette[index * 3 + 2]
+                dominant_colors.append((r, g, b))
+        else:
+            # Fallback if getcolors fails (rare)
+            dominant_colors = [(0, 0, 0)]
+
+        # Prepare Hex strings
+        hex_colors = []
+        for c in dominant_colors:
+            hex_colors.append("#{:02x}{:02x}{:02x}".format(c[0], c[1], c[2]))
+            
+        # 1. Output Hex List (comma separated)
+        hex_list_str = ", ".join(hex_colors)
         
-        # Create pure color image matching input dimensions (OR user-defined, but for now matching batch behavior)
-        # We'll return a single 512x512 pure color image to ensure it's usable, 
-        # or we could match input size. Let's make it typical generic size or match input?
-        # Matching input might be huge. Let's stick to a standard size or the size of input.
-        # ComfyUI usually expects standard tensors.
+        # 2. Output Individual Hex Ports (Top 5)
+        # Pad with empty string if fewer than 5 colors found
+        hex_ports = hex_colors[:5] + [""] * (5 - len(hex_colors[:5]))
         
-        # Create a solid color image for output
-        # Using a reasonable size 512x512
-        output_img = Image.new("RGB", (512, 512), tuple(dominant_color))
+        # 3. Create Palette Image
+        # Create a horizontal strip or grid showing all colors
+        # 512 width, height depends on count? Or fixed 512x512 with stripes?
+        # Let's do horizontal stripes of equal height for clarity
+        w, h = 512, 512
+        stripe_height = h // len(dominant_colors)
+        palette_img = Image.new("RGB", (w, h), (0, 0, 0))
+        draw = ImageDraw.Draw(palette_img)
         
+        for idx, color in enumerate(dominant_colors):
+            y0 = idx * stripe_height
+            # Make the last one fill the remaining space to avoid gaps
+            y1 = (idx + 1) * stripe_height if idx < len(dominant_colors) - 1 else h
+            draw.rectangle([0, y0, w, y1], fill=color)
+            
         # Convert back to torch tensor
-        output_img_np = np.array(output_img).astype(np.float32) / 255.0
-        output_tensor = torch.from_numpy(output_img_np)[None,] # Add batch dimension
+        palette_img_np = np.array(palette_img).astype(np.float32) / 255.0
+        palette_tensor = torch.from_numpy(palette_img_np)[None,] # Add batch dimension
         
-        return (output_tensor, hex_color)
+        return (palette_tensor, hex_list_str, hex_ports[0], hex_ports[1], hex_ports[2], hex_ports[3], hex_ports[4])
 
 
 NODE_CLASS_MAPPINGS = {
