@@ -74,12 +74,75 @@ class StringSplit:
         return tuple(results)
 
 
+class ImageDominantColor:
+    """
+    提取图片主色调，输出纯色图片和十六进制色值字符串
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "hex_color")
+    FUNCTION = "get_dominant_color"
+    CATEGORY = "image"
+
+    def get_dominant_color(self, image):
+        # image is a torch tensor: [batch, height, width, channels] (0-1 float)
+        # We process the first image in the batch
+        import torch
+        from PIL import Image
+        import numpy as np
+
+        # Convert tensor to PIL Image (take first image of batch)
+        i = 255. * image[0].cpu().numpy()
+        img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+
+        # Resize to speed up calculation and reduce noise
+        img_small = img.resize((150, 150))
+        
+        # Get colors (ignoring alpha if present, assuming RGB from ComfyUI)
+        if img_small.mode != "RGB":
+            img_small = img_small.convert("RGB")
+            
+        # Efficiently find dominant color using quantization
+        # This forces the image to 1 color, finding the most representative one
+        result = img_small.quantize(colors=1)
+        dominant_color = result.getpalette()[:3]
+        
+        # Hex string
+        hex_color = "#{:02x}{:02x}{:02x}".format(dominant_color[0], dominant_color[1], dominant_color[2])
+        
+        # Create pure color image matching input dimensions (OR user-defined, but for now matching batch behavior)
+        # We'll return a single 512x512 pure color image to ensure it's usable, 
+        # or we could match input size. Let's make it typical generic size or match input?
+        # Matching input might be huge. Let's stick to a standard size or the size of input.
+        # ComfyUI usually expects standard tensors.
+        
+        # Create a solid color image for output
+        # Using a reasonable size 512x512
+        output_img = Image.new("RGB", (512, 512), tuple(dominant_color))
+        
+        # Convert back to torch tensor
+        output_img_np = np.array(output_img).astype(np.float32) / 255.0
+        output_tensor = torch.from_numpy(output_img_np)[None,] # Add batch dimension
+        
+        return (output_tensor, hex_color)
+
+
 NODE_CLASS_MAPPINGS = {
     "StringConcat": StringConcat,
     "StringSplit": StringSplit,
+    "ImageDominantColor": ImageDominantColor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StringConcat": "String Concat (文本拼接)",
     "StringSplit": "String Split (文本拆分)",
+    "ImageDominantColor": "Image Dominant Color (主色提取)",
 }
