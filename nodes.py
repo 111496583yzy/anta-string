@@ -89,8 +89,8 @@ class ImageDominantColor:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("image_palette", "hex_list", "hex_1", "hex_2", "hex_3", "hex_4", "hex_5")
+    RETURN_TYPES = ("IMAGE", "STRING",) + ("STRING",) * 32
+    RETURN_NAMES = ("image_palette", "hex_list") + tuple(f"hex_{i}" for i in range(1, 33))
     FUNCTION = "get_dominant_colors"
     CATEGORY = "image"
 
@@ -100,41 +100,77 @@ class ImageDominantColor:
         import torch
         from PIL import Image, ImageDraw
         import numpy as np
+        import math
 
         # Convert tensor to PIL Image (take first image of batch)
         i = 255. * image[0].cpu().numpy()
         img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
 
-        # Resize to speed up calculation and reduce noise
+        # Resize to speed up calculation
         img_small = img.resize((150, 150))
         
-        # Get colors (ignoring alpha if present, assuming RGB from ComfyUI)
         if img_small.mode != "RGB":
             img_small = img_small.convert("RGB")
             
-        # Efficiently find dominant colors using quantization
-        # This reduces the image to 'max_colors' colors
-        result = img_small.quantize(colors=max_colors)
+        print(f"DEBUG: ImageDominantColor requested {max_colors} colors")
+
+            
+        # 1. Adaptively determine candidate count
+        # We need more candidates to allow filtering (e.g., getting past the 10 shades of brown)
+        candidate_count = max(max_colors * 5, 48)
         
-        # Get palette (r, g, b, r, g, b, ...)
+        # 2. Quantize to get candidate palette
+        result = img_small.quantize(colors=candidate_count)
         palette = result.getpalette() or []
-        # Quantize might return a palette of 256 entries (768 ints), trimming to used colors
-        # We need to find which colors are actually used and sort by frequency
-        # Convert quantized image to data to count frequencies
         color_counts = result.getcolors(maxcolors=256)
+        
+        dominant_colors = []
         if color_counts:
             # Sort by count (descending)
             color_counts.sort(key=lambda x: x[0], reverse=True)
-            # Limit to max_colors found (in case < max_colors)
-            dominant_colors = []
-            for count, index in color_counts[:max_colors]:
-                # Extract RGB from palette
+            
+            # Extract all candidate colors [ (r,g,b), ... ]
+            candidates = []
+            for count, index in color_counts:
                 r = palette[index * 3]
                 g = palette[index * 3 + 1]
                 b = palette[index * 3 + 2]
-                dominant_colors.append((r, g, b))
+                candidates.append((r, g, b))
+                
+            # 3. Diversity Filtering
+            # Iterate candidates and pick only if distinct enough from already selected
+            min_dist_sq = 25 * 25  # Threshold approx 25 in RGB space
+            
+            selected_colors = []
+            
+            for c in candidates:
+                if len(selected_colors) >= max_colors:
+                    break
+                    
+                is_distinct = True
+                for sc in selected_colors:
+                    # Euclidean distance squared: (r1-r2)^2 + ...
+                    dist_sq = (c[0]-sc[0])**2 + (c[1]-sc[1])**2 + (c[2]-sc[2])**2
+                    if dist_sq < min_dist_sq:
+                        is_distinct = False
+                        break
+                
+                if is_distinct:
+                    selected_colors.append(c)
+            
+            # If we didn't get enough colors due to strict filtering, append the rest from top frequency
+            # ignoring distance check (to fill the request)
+            if len(selected_colors) < max_colors:
+                for c in candidates:
+                    if len(selected_colors) >= max_colors:
+                        break
+                    # Avoid exact duplicates
+                    if c not in selected_colors:
+                        selected_colors.append(c)
+            
+            dominant_colors = selected_colors
+            
         else:
-            # Fallback if getcolors fails (rare)
             dominant_colors = [(0, 0, 0)]
 
         # Prepare Hex strings
@@ -145,40 +181,153 @@ class ImageDominantColor:
         # 1. Output Hex List (comma separated)
         hex_list_str = ", ".join(hex_colors)
         
-        # 2. Output Individual Hex Ports (Top 5)
-        # Pad with empty string if fewer than 5 colors found
-        hex_ports = hex_colors[:5] + [""] * (5 - len(hex_colors[:5]))
+        # 2. Output Individual Hex Ports (32 fixed ports)
+        # Pad with empty string if fewer than 32 colors found
+        total_ports = 32
+        hex_ports = hex_colors[:total_ports] + [""] * (total_ports - len(hex_colors[:total_ports]))
         
         # 3. Create Palette Image
-        # Create a horizontal strip or grid showing all colors
-        # 512 width, height depends on count? Or fixed 512x512 with stripes?
-        # Let's do horizontal stripes of equal height for clarity
         w, h = 512, 512
-        stripe_height = h // len(dominant_colors)
+        stripe_height = h // len(dominant_colors) if len(dominant_colors) > 0 else h
         palette_img = Image.new("RGB", (w, h), (0, 0, 0))
         draw = ImageDraw.Draw(palette_img)
         
         for idx, color in enumerate(dominant_colors):
             y0 = idx * stripe_height
-            # Make the last one fill the remaining space to avoid gaps
             y1 = (idx + 1) * stripe_height if idx < len(dominant_colors) - 1 else h
             draw.rectangle([0, y0, w, y1], fill=color)
             
         # Convert back to torch tensor
         palette_img_np = np.array(palette_img).astype(np.float32) / 255.0
-        palette_tensor = torch.from_numpy(palette_img_np)[None,] # Add batch dimension
+        palette_tensor = torch.from_numpy(palette_img_np)[None,] 
         
-        return (palette_tensor, hex_list_str, hex_ports[0], hex_ports[1], hex_ports[2], hex_ports[3], hex_ports[4])
+        return (palette_tensor, hex_list_str) + tuple(hex_ports)
+
+
+class MediaInfo:
+    """
+    获取媒体信息（图片、视频、音频）
+    支持输入：图片Tensor、音频Dict、VHS视频信息Dict、文件路径
+    输出：宽、高、时长、FPS、采样率等详细信息
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "file_path": ("STRING", {"default": "", "multiline": False}),
+                "image": ("IMAGE",),
+                "audio": ("AUDIO",),
+                "video_info": ("VHS_VIDEOINFO",),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT", "INT", "FLOAT", "FLOAT", "INT", "INT", "INT")
+    RETURN_NAMES = ("info_text", "width", "height", "batch_size", "fps", "duration", "frame_count", "sample_rate", "channels")
+    FUNCTION = "get_info"
+    CATEGORY = "utils"
+
+    def get_info(self, file_path="", image=None, audio=None, video_info=None):
+        import json
+        import os
+        
+        info = {}
+        
+        # Defaults
+        width = 0
+        height = 0
+        batch_size = 0
+        fps = 0.0
+        duration = 0.0
+        frame_count = 0
+        sample_rate = 0
+        channels = 0
+        
+        # 1. Image Tensor Info
+        if image is not None:
+            # [Batch, Height, Width, Channels]
+            shape = image.shape
+            batch_size = shape[0]
+            height = shape[1]
+            width = shape[2]
+            info["image_tensor"] = {
+                "batch_size": batch_size,
+                "height": height,
+                "width": width,
+                "channels": shape[3] if len(shape) > 3 else 1
+            }
+            
+        # 2. Audio Info
+        if audio is not None:
+            # ComfyUI audio dict: {'waveform': tensor, 'sample_rate': int}
+            if 'waveform' in audio:
+                waveform = audio['waveform']
+                # [Batch, Channels, Samples] or [Channels, Samples]
+                channels = waveform.shape[1] if len(waveform.shape) > 1 else 1
+                total_samples = waveform.shape[-1]
+                sample_rate = audio.get('sample_rate', 44100)
+                duration = total_samples / sample_rate if sample_rate > 0 else 0
+                
+                info["audio_tensor"] = {
+                    "sample_rate": sample_rate,
+                    "channels": channels,
+                    "total_samples": total_samples,
+                    "duration": round(duration, 4)
+                }
+
+        # 3. VHS Video Info
+        if video_info is not None:
+            # video_info is a dict from ComfyUI-VideoHelperSuite
+            # Expected keys: source_fps, source_width, source_height, source_duration, source_frame_count
+            fps = video_info.get("source_fps", video_info.get("loaded_fps", 0.0))
+            width = video_info.get("source_width", video_info.get("loaded_width", width))
+            height = video_info.get("source_height", video_info.get("loaded_height", height))
+            duration = video_info.get("source_duration", video_info.get("loaded_duration", duration))
+            frame_count = video_info.get("source_frame_count", video_info.get("loaded_frame_count", 0))
+            
+            info["video_info"] = video_info
+
+        # 4. File Path Info (Fallback/Supplement)
+        if file_path and os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+            file_ext = os.path.splitext(file_path)[1].lower()
+            info["file"] = {
+                "path": file_path,
+                "size_bytes": file_size,
+                "extension": file_ext
+            }
+            
+            # Simple Image Check using PIL
+            if file_ext in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff']:
+                try:
+                    from PIL import Image
+                    with Image.open(file_path) as img:
+                        if width == 0: width = img.width
+                        if height == 0: height = img.height
+                        info["file_image"] = {
+                            "format": img.format,
+                            "mode": img.mode,
+                            "width": img.width,
+                            "height": img.height
+                        }
+                except:
+                    pass
+        
+        # Construct summary string
+        return (json.dumps(info, indent=4, ensure_ascii=False), width, height, batch_size, fps, duration, frame_count, sample_rate, channels)
 
 
 NODE_CLASS_MAPPINGS = {
     "StringConcat": StringConcat,
     "StringSplit": StringSplit,
     "ImageDominantColor": ImageDominantColor,
+    "MediaInfo": MediaInfo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StringConcat": "String Concat (文本拼接)",
     "StringSplit": "String Split (文本拆分)",
     "ImageDominantColor": "Image Dominant Color (主色提取)",
+    "MediaInfo": "Media Info (媒体信息)",
 }
